@@ -84,8 +84,11 @@ class LlamaRMSNorm(nn.Module):
 
     def forward(self, hidden_states):
         input_dtype = hidden_states.dtype
+        # 转为32位
         hidden_states = hidden_states.to(torch.float32)
+        # 先对所有元素取平方值，然后在embed_dim维度计算平均值
         variance = hidden_states.pow(2).mean(-1, keepdim=True)
+        # 再乘以标准差的倒数
         hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
         return self.weight * hidden_states.to(input_dtype)
 
@@ -269,21 +272,29 @@ class LlamaAttention(nn.Module):
             )
 
         self.attention_dropout = config.attention_dropout
+        # 隐藏层大小
         self.hidden_size = config.hidden_size
+        # 注意力头的数量
         self.num_heads = config.num_attention_heads
+        # 每个头的维度
         self.head_dim = self.hidden_size // self.num_heads
+        # key和value头的数量
         self.num_key_value_heads = config.num_key_value_heads
+        # GQA分组数量
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
+        # 最大位置长度
         self.max_position_embeddings = config.max_position_embeddings
+        # rope角度
         self.rope_theta = config.rope_theta
         self.is_causal = True
 
+        # hidden_size可以被hdead_dim整除。
         if (self.head_dim * self.num_heads) != self.hidden_size:
             raise ValueError(
                 f"hidden_size must be divisible by num_heads (got `hidden_size`: {self.hidden_size}"
                 f" and `num_heads`: {self.num_heads})."
             )
-
+        # q,k,v,o变量的映射线性层
         self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=config.attention_bias)
         self.k_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias)
         self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias)
@@ -331,6 +342,7 @@ class LlamaAttention(nn.Module):
         bsz, q_len, _ = hidden_states.size()
 
         if self.config.pretraining_tp > 1:
+            # 采用tensor parallel，对key和value分片处理
             key_value_slicing = (self.num_key_value_heads * self.head_dim) // self.config.pretraining_tp
             query_slices = self.q_proj.weight.split(
                 (self.num_heads * self.head_dim) // self.config.pretraining_tp, dim=0
@@ -338,6 +350,10 @@ class LlamaAttention(nn.Module):
             key_slices = self.k_proj.weight.split(key_value_slicing, dim=0)
             value_slices = self.v_proj.weight.split(key_value_slicing, dim=0)
 
+            # 线性投影+拼接
+            # hidden_states的shape是:[batch_size, seq_len, hidden_size] ->
+            # [batch_size, seq_len, key_value_slicing] ->
+            # [batch_size, seq_len, self.num_heads * self.head_dim]
             query_states = [F.linear(hidden_states, query_slices[i]) for i in range(self.config.pretraining_tp)]
             query_states = torch.cat(query_states, dim=-1)
 
@@ -352,6 +368,7 @@ class LlamaAttention(nn.Module):
             key_states = self.k_proj(hidden_states)
             value_states = self.v_proj(hidden_states)
 
+        # 交换位置
         query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
         key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
         value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
@@ -359,26 +376,34 @@ class LlamaAttention(nn.Module):
         past_key_value = getattr(self, "past_key_value", past_key_value)
         cos, sin = self.rotary_emb(value_states, position_ids)
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
-
+        # 如果有之前的kv，比如kv cache，更新。
         if past_key_value is not None:
             # sin and cos are specific to RoPE models; cache_position needed for the static cache
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
             key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
+        # 这里是GQA的方法。
         key_states = repeat_kv(key_states, self.num_key_value_groups)
         value_states = repeat_kv(value_states, self.num_key_value_groups)
 
+        # transformer论文中的attention操作
+        # 先做QK^T / sqrt(d),得到softmax操作之前的score
         attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
 
+        # 如果有attention_mask,则在softmax之前做加法,别掩码部分为-inf,未被掩码部分为0
+        # 最开始的两个掩码函数就是完成这个操作的
         if attention_mask is not None:  # no matter the length, we just slice it
             causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
             attn_weights = attn_weights + causal_mask
 
         # upcast attention to fp32
+        # 使用float32数据格式,计算结束后转换为前面的数据格式
         attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
         attn_weights = nn.functional.dropout(attn_weights, p=self.attention_dropout, training=self.training)
+        # 最后和输出张量相乘得到输出注意力
         attn_output = torch.matmul(attn_weights, value_states)
 
+        # 对输出进行形状变换,使其能够符合后面MLP层计算的输入形
         if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
             raise ValueError(
                 f"`attn_output` should be of size {(bsz, self.num_heads, q_len, self.head_dim)}, but is"
@@ -390,6 +415,7 @@ class LlamaAttention(nn.Module):
         attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
 
         if self.config.pretraining_tp > 1:
+            # tensor parallel
             attn_output = attn_output.split(self.hidden_size // self.config.pretraining_tp, dim=2)
             o_proj_slices = self.o_proj.weight.split(self.hidden_size // self.config.pretraining_tp, dim=1)
             attn_output = sum([F.linear(attn_output[i], o_proj_slices[i]) for i in range(self.config.pretraining_tp)])
@@ -735,6 +761,7 @@ class LlamaDecoderLayer(nn.Module):
 
         residual = hidden_states
 
+        # 归一化处理
         hidden_states = self.input_layernorm(hidden_states)
 
         # Self Attention
@@ -959,6 +986,7 @@ class LlamaModel(LlamaPreTrainedModel):
         use_cache = use_cache if use_cache is not None else self.config.use_cache
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
+        # input_ids和inputs_embeds只能用一个。假如传入input_ids则转换为inputs_embeds
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError(
                 "You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"
@@ -974,11 +1002,13 @@ class LlamaModel(LlamaPreTrainedModel):
             inputs_embeds = self.embed_tokens(input_ids)
 
         past_seen_tokens = 0
+        # 如果使用kv cache 则从之前的物理地址读past_key_values
         if use_cache:  # kept for BC (cache positions)
             if not isinstance(past_key_values, StaticCache):
                 past_key_values = DynamicCache.from_legacy_cache(past_key_values)
                 past_seen_tokens = past_key_values.get_seq_length()
 
+        # 如果没有cache_position，则创建一个放cache的序列
         if cache_position is None:
             if isinstance(past_key_values, StaticCache):
                 raise ValueError("cache_position is a required argument when using StaticCache.")
@@ -1000,9 +1030,10 @@ class LlamaModel(LlamaPreTrainedModel):
         next_decoder_cache = None
 
         for decoder_layer in self.layers:
+            # 如果要输出隐藏层状态就记录下来
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
-
+            # 如果采用了梯度检查点
             if self.gradient_checkpointing and self.training:
                 layer_outputs = self._gradient_checkpointing_func(
                     decoder_layer.__call__,
